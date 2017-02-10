@@ -3,27 +3,42 @@
  */
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include "ts/ts.h"
 
 namespace {
 struct MyData {
-  TSVIO vio;
-  TSIOBuffer buffer;
-  TSIOBufferReader reader;
+  TSVIO request_vio;
+  TSIOBuffer request_buffer;
+  TSIOBufferReader request_reader;
+  
+  TSVIO response_vio;
+  TSIOBuffer response_buffer;
+  TSIOBufferReader response_reader;
+
   TSCont contp;
 };
 static MyData *my_data_alloc(TSCont contp) {
   MyData *data = static_cast<MyData *>(TSmalloc(sizeof(MyData)));
   data->contp = contp;
-  data->vio = nullptr;
-  data->buffer = nullptr;
-  data->reader = nullptr;
+
+  data->request_vio = nullptr;
+  data->request_buffer = nullptr;
+  data->request_reader = nullptr;
+
+  data->response_vio = nullptr;
+  data->response_buffer = nullptr;
+  data->response_reader = nullptr;
+
   return data;
 }
 static void my_data_destroy(MyData *data) {
   if (data) {
-    if (data->buffer) {
-      TSIOBufferDestroy(data->buffer);
+    if (data->request_buffer) {
+      TSIOBufferDestroy(data->request_buffer);
+    }
+    if (data->response_buffer) {
+      TSIOBufferDestroy(data->response_buffer);
     }
     TSfree(data);
   }
@@ -32,7 +47,8 @@ static void my_data_destroy(MyData *data) {
 
 static int naokato_plugin(TSCont contp, TSEvent event, void *edata);
 static int intercept(TSCont contp, TSEvent event, void *edata);
-static int handle_event(MyData *);
+static int handle_read(MyData *);
+static int handle_write(MyData *);
 
 void TSPluginInit(int argc, const char *argv[]) {
   TSPluginRegistrationInfo info;
@@ -86,29 +102,45 @@ static int intercept(TSCont contp, TSEvent event, void *edata) {
     case TS_EVENT_NET_ACCEPT: {
       TSError("event net accept");
       TSCont client_contp = static_cast<TSCont>(edata);
-      MyData *request_data = my_data_alloc(client_contp);
-      TSContDataSet(contp, request_data);
+      MyData *data = my_data_alloc(client_contp);
+      TSContDataSet(contp, data);
 
-      request_data->buffer = TSIOBufferCreate();
-      request_data->reader = TSIOBufferReaderAlloc(request_data->buffer);
-      request_data->vio =
-          TSVConnRead(client_contp, contp, request_data->buffer, INT64_MAX);
+      data->request_buffer = TSIOBufferCreate();
+      data->request_reader = TSIOBufferReaderAlloc(data->request_buffer);
+      data->request_vio =
+          TSVConnRead(client_contp, contp, data->request_buffer, INT64_MAX);
+      
+      data->response_buffer = TSIOBufferCreate();
+      data->response_reader = TSIOBufferReaderAlloc(data->response_buffer);
+      data->response_vio =
+          TSVConnWrite(client_contp, contp, data->response_reader, INT64_MAX);
 
-      handle_event(request_data);
+      handle_read(data);
+      handle_write(data);
 
       return 0;
     }
     case TS_EVENT_VCONN_EOS:
     case TS_EVENT_VCONN_READ_COMPLETE: {
       TSError("read complete from client");
-      MyData *data = static_cast<MyData *>(TSContDataGet(contp));
-      TSVConnShutdown(data->contp, 0, 1);
       return 0;
     }
     case TS_EVENT_VCONN_READ_READY: {
       TSError("read ready from client");
       MyData *data = static_cast<MyData *>(TSContDataGet(contp));
-      handle_event(data);
+      handle_read(data);
+      return 0;
+    }
+    case TS_EVENT_VCONN_WRITE_COMPLETE: {
+      TSError("write complete to client");
+      MyData *data = static_cast<MyData *>(TSContDataGet(contp));
+      TSVConnShutdown(data->contp, 0, 1);
+      return 0;
+    }
+    case TS_EVENT_VCONN_WRITE_READY: {
+      TSError("write ready to client");
+      MyData *data = static_cast<MyData *>(TSContDataGet(contp));
+      TSVIOReenable(data->response_vio);
       return 0;
     }
     default:
@@ -118,31 +150,40 @@ static int intercept(TSCont contp, TSEvent event, void *edata) {
   return 0;
 }
 
-static int handle_event(MyData *request_data) {
-  int64_t towrite = TSVIONTodoGet(request_data->vio);
+static int handle_read(MyData *data) {
+  int64_t towrite = TSVIONTodoGet(data->request_vio);
 
   if (towrite > 0) {
-    TSError("handle_event: data from client request still exists(before read)");
+    TSError("handle_read: data from client request still exists(before read)");
 
-    int64_t avail = TSIOBufferReaderAvail(request_data->reader);
+    int64_t avail = TSIOBufferReaderAvail(data->request_reader);
     if (towrite > avail) {
       towrite = avail;
     }
-
-    TSIOBufferReaderConsume(request_data->reader, towrite);
-    TSVIONDoneSet(request_data->vio,
-                  TSVIONDoneGet(request_data->vio) + towrite);
+  
+    TSIOBufferReaderConsume(data->request_reader, towrite);
+    TSVIONDoneSet(data->request_vio,
+                  TSVIONDoneGet(data->request_vio) + towrite);
   }
 
-  towrite = TSVIONTodoGet(request_data->vio);
+  towrite = TSVIONTodoGet(data->request_vio);
   if (towrite > 0) {
-    TSError("handle_event: data from client request still exists(after read)");
-    TSVIOReenable(request_data->vio);
+    TSError("handle_read: data from client request still exists(after read)");
+    TSVIOReenable(data->request_vio);
     return 0;
   }
 
-  TSError("handle_event: read data from client request completed");
-  TSVIONBytesSet(request_data->vio, TSVIONDoneGet(request_data->vio));
-  TSVIOReenable(request_data->vio);
+  TSError("handle_read: read data from client request completed");
+  TSVIONBytesSet(data->request_vio, TSVIONDoneGet(data->request_vio));
+  TSVIOReenable(data->request_vio);
+  return 0;
+}
+
+static int handle_write(MyData *data) {
+  TSError("handle_write");
+  const std::string response_message = "HTTP/1.1 500 Internal Server Error\r\n\r\nplugin response!\n";
+  TSIOBufferWrite(data->response_buffer, response_message.data(), response_message.length());
+  TSVIONBytesSet(data->response_vio, response_message.length());
+  TSVIOReenable(data->response_vio);
   return 0;
 }
