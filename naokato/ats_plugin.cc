@@ -11,7 +11,7 @@ struct MyData {
   TSVIO request_vio;
   TSIOBuffer request_buffer;
   TSIOBufferReader request_reader;
-  
+
   TSVIO response_vio;
   TSIOBuffer response_buffer;
   TSIOBufferReader response_reader;
@@ -39,6 +39,9 @@ static void my_data_destroy(MyData *data) {
     }
     if (data->response_buffer) {
       TSIOBufferDestroy(data->response_buffer);
+    }
+    if (data->contp) {
+      TSVConnClose(data->contp);
     }
     TSfree(data);
   }
@@ -109,7 +112,7 @@ static int intercept(TSCont contp, TSEvent event, void *edata) {
       data->request_reader = TSIOBufferReaderAlloc(data->request_buffer);
       data->request_vio =
           TSVConnRead(client_contp, contp, data->request_buffer, INT64_MAX);
-      
+
       data->response_buffer = TSIOBufferCreate();
       data->response_reader = TSIOBufferReaderAlloc(data->response_buffer);
       data->response_vio =
@@ -120,7 +123,6 @@ static int intercept(TSCont contp, TSEvent event, void *edata) {
 
       return 0;
     }
-    case TS_EVENT_VCONN_EOS:
     case TS_EVENT_VCONN_READ_COMPLETE: {
       TSError("read complete from client");
       return 0;
@@ -143,6 +145,14 @@ static int intercept(TSCont contp, TSEvent event, void *edata) {
       TSVIOReenable(data->response_vio);
       return 0;
     }
+    case TS_EVENT_VCONN_EOS:
+    case TS_EVENT_ERROR: {
+      TSError("EOS or ERROR:%d", event);
+      my_data_destroy(static_cast<MyData *>(TSContDataGet(contp)));
+      TSContDestroy(contp);
+      TSError("intercept end");
+      return 0;
+    }
     default:
       TSError("other event:%d", event);
       break;
@@ -160,7 +170,7 @@ static int handle_read(MyData *data) {
     if (towrite > avail) {
       towrite = avail;
     }
-  
+
     TSIOBufferReaderConsume(data->request_reader, towrite);
     TSVIONDoneSet(data->request_vio,
                   TSVIONDoneGet(data->request_vio) + towrite);
@@ -181,8 +191,10 @@ static int handle_read(MyData *data) {
 
 static int handle_write(MyData *data) {
   TSError("handle_write");
-  const std::string response_message = "HTTP/1.1 500 Internal Server Error\r\n\r\nplugin response!\n";
-  TSIOBufferWrite(data->response_buffer, response_message.data(), response_message.length());
+  const std::string response_message =
+      "HTTP/1.1 500 Internal Server Error\r\n\r\nplugin response!\n";
+  TSIOBufferWrite(data->response_buffer, response_message.data(),
+                  response_message.length());
   TSVIONBytesSet(data->response_vio, response_message.length());
   TSVIOReenable(data->response_vio);
   return 0;
